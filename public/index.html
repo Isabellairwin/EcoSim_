@@ -1,0 +1,150 @@
+require("dotenv").config();
+const express = require("express");
+const mongoose = require("mongoose");
+const http = require("http");
+const { Server } = require("socket.io");
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+
+// ---------- DATABASE ----------
+const Reading = mongoose.model("Reading", {
+  traffic: Number,
+  power: Number,
+  water: Number,
+  aqi: Number,
+  scenario: String,
+  time: { type: Date, default: Date.now },
+});
+
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log("MongoDB connected"))
+  .catch((err) => console.log("Mongo error:", err.message));
+
+// ---------- DASHBOARD PAGE ----------
+const PAGE = `<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ecosim Dashboard</title>
+  <style>
+    body { font-family: Arial; background: #0f172a; color: white; text-align: center; }
+    .grid { display: flex; gap: 15px; justify-content: center; flex-wrap: wrap; margin: 20px; }
+    .card { background: #1e293b; padding: 20px; border-radius: 12px; width: 150px; }
+    .card h2 { margin: 0; font-size: 32px; color: #38bdf8; }
+    #alerts { color: #f87171; font-size: 18px; min-height: 60px; }
+    button { padding: 10px 16px; margin: 4px; border: 0; border-radius: 8px;
+             background: #38bdf8; cursor: pointer; font-weight: bold; }
+    button.active { background: #facc15; }
+  </style>
+</head>
+<body>
+  <h1>Ecosim: Smart City Dashboard</h1>
+  <div class="grid">
+    <div class="card">Traffic %<h2 id="traffic">-</h2></div>
+    <div class="card">Power %<h2 id="power">-</h2></div>
+    <div class="card">Water %<h2 id="water">-</h2></div>
+    <div class="card">AQI<h2 id="aqi">-</h2></div>
+  </div>
+
+  <h3>Scenarios</h3>
+  <button id="b-normal" onclick="setScenario('normal')">Normal</button>
+  <button id="b-rush" onclick="setScenario('rush')">Rush hour</button>
+  <button id="b-outage" onclick="setScenario('outage')">Power surge</button>
+  <button id="b-pollution" onclick="setScenario('pollution')">Pollution</button>
+
+  <h3>Alerts</h3>
+  <div id="alerts">None</div>
+
+  <div style="max-width:700px;margin:20px auto;">
+    <canvas id="chart"></canvas>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    var socket = io();
+    var chart = new Chart(document.getElementById("chart"), {
+      type: "line",
+      data: { labels: [], datasets: [
+        { label: "Traffic", data: [], borderColor: "#38bdf8" },
+        { label: "Power", data: [], borderColor: "#facc15" },
+        { label: "AQI", data: [], borderColor: "#f87171" }
+      ]},
+      options: { animation: false }
+    });
+
+    function setScenario(s) { socket.emit("scenario", s); }
+
+    socket.on("reading", function (d) {
+      ["traffic", "power", "water", "aqi"].forEach(function (k) {
+        document.getElementById(k).textContent = d[k].toFixed(1);
+      });
+      document.getElementById("alerts").innerHTML =
+        d.alerts.length ? d.alerts.join("<br>") : "All systems normal";
+
+      ["normal", "rush", "outage", "pollution"].forEach(function (s) {
+        document.getElementById("b-" + s).className = (s === d.scenario) ? "active" : "";
+      });
+
+      chart.data.labels.push(new Date().toLocaleTimeString());
+      chart.data.datasets[0].data.push(d.traffic);
+      chart.data.datasets[1].data.push(d.power);
+      chart.data.datasets[2].data.push(d.aqi);
+      if (chart.data.labels.length > 20) {
+        chart.data.labels.shift();
+        chart.data.datasets.forEach(function (ds) { ds.data.shift(); });
+      }
+      chart.update();
+    });
+  </script>
+</body>
+</html>`;
+
+app.get("/", (req, res) => res.send(PAGE));
+
+// ---------- SCENARIO CONTROL ----------
+let scenario = "normal";
+io.on("connection", (socket) => {
+  socket.on("scenario", (s) => { scenario = s; console.log("Scenario:", s); });
+});
+
+// ---------- SIMULATION ENGINE (every 2 seconds) ----------
+setInterval(async () => {
+  const hour = new Date().getHours();
+  const rush = (hour >= 8 && hour <= 10) || (hour >= 17 && hour <= 19);
+
+  const data = {
+    traffic: Math.min(100, (rush ? 70 : 30) + Math.random() * 25),
+    power: 40 + Math.random() * 40 + (hour >= 18 ? 15 : 0),
+    water: 30 + Math.random() * 40,
+    aqi: 40 + Math.random() * 80,
+  };
+
+  // scenarios
+  if (scenario === "rush") data.traffic = Math.min(100, data.traffic + 30);
+  if (scenario === "outage") data.power = Math.min(100, data.power + 40);
+  if (scenario === "pollution") data.aqi += 80;
+
+  // smart rules
+  const alerts = [];
+  if (data.traffic > 80) alerts.push("Traffic high: extended green signal");
+  if (data.aqi > 100) alerts.push("Air quality poor: pollution alert");
+  if (data.power > 85) alerts.push("Power peak: rerouting load");
+
+  try {
+    await Reading.create({ ...data, scenario });
+  } catch (e) {
+    console.log("Save error:", e.message);
+  }
+
+  io.emit("reading", { ...data, alerts, scenario });
+  console.log(
+    "Saved:", data.traffic.toFixed(1),
+    "| Scenario:", scenario,
+    "| Alerts:", alerts.length ? alerts.join(", ") : "none"
+  );
+}, 2000);
+
+server.listen(3000, () => console.log("Running on http://localhost:3000"));
